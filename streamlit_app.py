@@ -141,3 +141,32 @@ def to_md(results, synthesis, sport, topics, log):
     L.append("\n## Sources")
     for s in log["sources"]: L.append(f"- {s['url']} - {s['status']}")
     return "\n".join(L)
+
+
+st.set_page_config(
+    page_title="Sports Psych Director Scout",
+    layout="wide"
+)
+
+st.title("Sports Psych Director Scout")
+st.write("Research sports psychology and athletic performance.")
+
+query = st.text_input(
+    "What would you like to research?",
+    "sports directors mental performance"
+)
+
+if st.button("Search"):
+    with st.spinner("Searching the web..."):
+        results = web_search(query, n=5)
+
+    if isinstance(results, dict):
+        st.error(results.get("error", "Search failed."))
+    elif not results:
+        st.warning("No results found.")
+    else:
+        for result in results:
+            st.subheader(result.get("title", "Untitled"))
+            st.write(result.get("snippet", ""))
+            st.write(result.get("url", ""))
+
