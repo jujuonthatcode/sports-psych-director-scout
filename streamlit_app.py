@@ -386,7 +386,7 @@ tabs = st.tabs([
     "👤 Writers & Sources",
     "🔎 Search Log",
     "⬇️ Downloads",
-    "📗 Guide & Scoring"
+    "📗 Guide & Scoring",
     "🌐 Social Media"
 
 ])
