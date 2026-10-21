@@ -748,7 +748,7 @@ with tabs[6]:
 
 # SOCIAL MEDIA RESEARCH TAB
 
-with tabs[8]:
+with tabs[7]:
     st.subheader("Social Media Listening")
 
     st.caption(
