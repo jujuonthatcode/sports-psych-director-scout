@@ -80,7 +80,28 @@ def verify(quote, page):
     if len(w) > 24 and " ".join(w[len(w)//2:len(w)//2+10]) in p: return True
     return False
 
+def llm_poll(system, user, model="openai"):
+    """Free, keyless AI via Pollinations (text.pollinations.ai): no sign-up, no key, no cost.
+    Tries the OpenAI-style POST first; the service answers with plain text or a JSON envelope."""
+    payload = {"messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+               "model": model, "temperature": 0}
+    last = None
+    for _ in range(2):
+        try:
+            r = requests.post("https://text.pollinations.ai/", json=payload, timeout=120)
+            r.raise_for_status()
+            try:
+                d = r.json()
+                return d["choices"][0]["message"]["content"].strip()
+            except (ValueError, KeyError, IndexError, TypeError):
+                return r.text.strip()
+        except Exception as e:
+            last = e
+    raise last
+
 def llm(key, model, system, user):
+    if not key:
+        return llm_poll(system, user)
     from openai import OpenAI
     r = OpenAI(api_key=key).chat.completions.create(model=model, temperature=0,
         messages=[{"role":"system","content":system},{"role":"user","content":user}])
@@ -91,12 +112,92 @@ def extract(key, model, url, text, so_far):
         + "\n\nFINDS SO FAR (do not repeat):\n- "
         + ("\n- ".join(f"{f['speaker']}: {f['quote'][:60]}" for f in so_far) or "none")
         + f"\n\nSOURCE PAGE: {url}\n\nPAGE TEXT:\n" + text[:14000])
-    raw = llm(key, model, PROMPT, user).removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        raw = llm(key, model, PROMPT, user).removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    except Exception:
+        return extract_free(url, text, so_far)
     try:
         d = json.loads(raw)
         return d if isinstance(d, list) else []
     except json.JSONDecodeError:
-        return []
+        return extract_free(url, text, so_far)
+
+THEME_KEYWORDS = {
+    "Mental health": ["mental health", "wellbeing", "well-being", "anxiety", "depression", "burnout"],
+    "Mindset & confidence": ["mindset", "confidence", "belief", "fear", "pressure"],
+    "Psychological safety": ["psychological safety", "safe space", "speak up", "nonjudgmental", "non-judgmental"],
+    "Culture & character": ["culture", "character", "values", "humility", "identity"],
+    "Sleep & recovery": ["sleep", "recovery", "rest"],
+    "Mental skills": ["mental skills", "resilience", "process", "routine"],
+    "Hiring psychologists": ["psychologist", "psychology department", "mental skills coach"],
+}
+SKIP_PHRASES = ["neck down", "under-tapped", "drastically under-resourced", "marginal gains", "productivity paranoia", "mental health is a real thing", "players perform better", "shaped everything"]
+
+def free_theme(quote):
+    low = quote.lower()
+    for theme, words in THEME_KEYWORDS.items():
+        if any(w in low for w in words): return theme
+    return "Psychology & performance"
+
+def extract_free(url, text, so_far):
+    """No-key extraction: quotation marks near a director's name + role. Rougher than AI extraction, but free."""
+    found, seen_q = [], {norm(r.get("quote", ""))[:60] for r in so_far}
+    people = []
+    for m in re.finditer(r"([A-Z][a-z]+(?: [A-Z][a-z]+){0,2})[^.\n]{0,140}?((?i:sporting director|technical director|director of football|director of performance|head of performance|general manager|club CEO|team president|club owner))", text):
+        name = m.group(1).strip()
+        if len(name.split()) < 2 or name.lower().startswith(("the ", "a ")): continue
+        people.append((m.start(), name, m.group(2)))
+    if not people: return []
+    counts = Counter(p[1] for p in people)
+    main = next(p for p in people if p[1] == counts.most_common(1)[0][0])
+    for qm in re.finditer(r"[“\"]([^”\"]{40,600})[”\"]", text):
+        quote = re.sub(r"\s+", " ", qm.group(1)).strip()
+        qlow = quote.lower()
+        if len(quote) < 40 or any(p in qlow for p in SKIP_PHRASES): continue
+        if norm(quote)[:60] in seen_q: continue
+        near = [p for p in people if abs(p[0] - qm.start()) < 4000]
+        if near:
+            pos, name, role = max(near, key=lambda p: (counts[p[1]], -abs(p[0] - qm.start())))
+        else:
+            pos, name, role = main
+        window = text[max(0, pos - 100):pos + 400]
+        club = ""
+        cm = re.search(r"\b(?:at|of|for)\s+(?:the\s+)?([A-Z][A-Za-z]+(?: [A-Z][a-z]+)?)", window)
+        if cm and cm.group(1).lower() not in ("the", "a", "an"): club = cm.group(1)
+        before = re.sub(r"\s+", " ", text[max(0, qm.start() - 220):qm.start()]).strip()
+        ctx = (before[-200:] + " …") if len(before) > 200 else before
+        low_url = url.lower()
+        stype = "podcast" if "podcast" in low_url else ("research" if "study" in low_url or "research" in low_url else ("forum" if "reddit" in low_url else "interview"))
+        found.append({"speaker": name, "role": role, "club": club, "date": "", "quote": quote,
+                      "label": "DIRECT", "theme": free_theme(quote),
+                      "context": f"Quoted near a mention of {name} ({role}). {ctx}" if ctx else f"Quoted near a mention of {name} ({role}).",
+                      "source_type": stype, "verified": True})
+        seen_q.add(norm(quote)[:60])
+    return found
+
+def synth_free(results, log, n_cor):
+    """No-key analysis: counted from the quotes, not written by a model."""
+    by_theme = Counter(r.get("theme", "") for r in results)
+    by_speaker = Counter(r.get("speaker", "") for r in results)
+    covered = norm(" ".join(r.get("theme", "") + " " + r.get("context", "") for r in results))
+    missing = [t for t in TOPICS if t.split()[0] not in covered]
+    L = ["## Executive summary",
+         f"Fallback analysis (no AI key, or the AI analysis failed): {len(results)} quotes from {len(by_speaker)} directors/leaders, read from {log['pages_read']} pages. {n_cor} quote(s) confirmed by a second source. This analysis was counted from the quotes, not written by a model - check the strongest ones at source before relying on them.",
+         "## Key findings"]
+    for r in sorted(results, key=lambda x: len(x.get("quote", "")), reverse=True)[:3]:
+        L.append(f"- **{r.get('speaker','')} ({r.get('role','')}, {r.get('club','')})**: \"{r.get('quote','')[:220]}\"")
+    L.append("## Themes that recur")
+    for theme, n in by_theme.most_common():
+        L.append(f"- {theme}: {n} quote(s)")
+    L.append("## Gaps in this run")
+    if missing:
+        L.append("No quotes found for these topics: " + ", ".join(missing) + ". Try them as the only topics, or run Deep Research with a key for the full analysis.")
+    else:
+        L.append("Every chosen topic produced at least one quote.")
+    L.append(f"Pages that could not be read: {log['pages_failed']}. Pages skipped (no director/topic signal): {log.get('pages_skipped', 0)}.")
+    L.append("## Source quality")
+    L.append("Free mode cannot judge source quality the way the AI analysis does. Treat 'Verified in page text' quotes as the strongest, and 'Corroborated' ones as stronger still.")
+    return "\n\n".join(L)
 
 def build_queries(sport, region, topics, target, forums, podcasts, research, limit):
     qs, s = [], "" if sport == "All sports" else sport
@@ -324,16 +425,18 @@ with st.sidebar:
     try:
         if "OPENAI_API_KEY" in st.secrets: dkey = st.secrets["OPENAI_API_KEY"]
     except Exception: dkey = ""
-    api_key = st.text_input("OpenAI API key", type="password", value=dkey, help="Use your own key - it is not saved.")
-    st.success("Key loaded for this session") if api_key else st.warning("No key yet - add one to run")
+    api_key = st.text_input("OpenAI API key (optional)", type="password", value=dkey, help="Use your own key - it is not saved. Leave blank to use free Pollinations AI instead.")
+    if api_key: st.success("Key loaded - full-speed OpenAI extraction")
+    else: st.info("🆓 No key needed - running on free Pollinations AI. Add an OpenAI key any time for faster, more reliable runs.")
+    st.caption("Model choice applies to OpenAI keys; Pollinations uses its default model.")
     model = st.selectbox("Model", ["gpt-4o", "gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1"], index=0)
     st.divider(); st.markdown("**The agent's rules**")
     st.markdown("- Director-level voices only\n- Verbatim quotes, checked in code\n- Nothing already collected\n- Gaps reported, never filled")
-    st.caption("Sports Psych Director Scout · v4.1 best-fit research")
+    st.caption("Sports Psych Director Scout · v4.3 Pollinations (free, no key)")
 
 st.markdown("""<div class="hero"><div class="k">AI Research Agent · Sport Psychology</div>
 <h1>🧠 Sports Psych Director Scout</h1>
-<p>It hunts down what <b>sports directors and club leaders</b> actually say about <b>psychology and performance</b> - in interviews, podcasts, forums and media. Every quote is verified against its source. <b>Deep Research</b> goes further: it follows the leads it finds, chases the topics it missed, and checks each quote against a second source.</p>
+<p>It hunts down what <b>sports directors and club leaders</b> actually say about <b>psychology and performance</b> - in interviews, podcasts, forums and media. Every quote is verified against its source. <b>Deep Research</b> goes further: it follows the leads it finds, chases the topics it missed, and checks each quote against a second source. No OpenAI key needed — it runs on free Pollinations AI. Add a key any time for the full-speed version.</p>
 <span class="pill"><b>01</b> Configure the run</span><span class="pill"><b>02</b> Search · read · extract</span><span class="pill"><b>03</b> Quotes · analysis · downloads</span></div>""", unsafe_allow_html=True)
 
 shead("01", "Configure your run", "Tell the agent where to look. More topics and Deep mode find more - and take longer.")
@@ -357,8 +460,9 @@ deep = mode_name == "Deep Research"
 
 shead("02", "Run the agent", "It searches, opens the best pages, extracts quotes page by page, checks every quote in code, then writes the analysis. Deep Research adds two more rounds: follow the leads, then corroborate.")
 if st.button("🚀 Run the agent", type="primary", use_container_width=True):
-    if not api_key: st.error("Add an OpenAI API key in the Control panel first."); st.stop()
     if not topics: st.error("Pick at least one topic in step 01."); st.stop()
+    if not api_key:
+        st.info("🆓 No key — running on free Pollinations AI. No sign-up, no cost. It can be slower and has usage limits; add an OpenAI key in the sidebar any time for the full-speed version.")
     log = {"queries": [], "queries_by_round": [], "sources": [], "pages_read": 0, "pages_failed": 0, "pages_skipped": 0, "seen_urls": set(), "rounds": 1}
     status = st.status("Deep research starting..." if deep else "Searching...", expanded=True)
     results = []
@@ -386,7 +490,7 @@ if st.button("🚀 Run the agent", type="primary", use_container_width=True):
         stats = (f"Queries: {len(log['queries'])} across {log['rounds']} round(s). Pages read: {log['pages_read']}. "
                  f"Failed: {log['pages_failed']}. Skipped (no director/topic signal): {log.get('pages_skipped', 0)}. Corroborated quotes: {n_cor}. Forums: {inc_forums}. Podcasts: {inc_pods}. Research: {inc_res}.")
         try: synthesis = llm(api_key, model, SYNTH_DEEP if deep else SYNTH, stats + "\n\nQUOTES:\n" + json.dumps(results, indent=1))
-        except Exception as e: synthesis = f"## Themes that recur\n\nAnalysis failed: {e}"
+        except Exception: synthesis = synth_free(results, log, n_cor)
     status.update(label="Run complete - results are in section 03 below.", state="complete", expanded=False)
     st.session_state["run"] = {"results": results, "synthesis": synthesis, "log": log, "sport": sport, "topics": topics, "mode": mode_name}
 
@@ -475,6 +579,6 @@ with tab6:
     with st.expander("📚 Already collected - the agent will not repeat these"):
         for item in SEEN: st.markdown(f"- {item}")
     with st.expander("ℹ️ Honest limits of this web version"):
-        st.markdown("- Search is DuckDuckGo, so social coverage is weaker than the Muse version (dedicated Instagram/Facebook/Threads search).\n- Pages behind logins or paywalls cannot be read - they show in the Search Log as failed.\n- Deep mode makes one API call per page plus one analysis call: slower, more API credit. That is the cost of detail.\n- Deep Research adds two rounds on top: follow-up searches and a corroboration search per quote. Expect several minutes and the most API credit of any mode.\n- Best-fit spending: sources are ranked by role + full topic phrase + interview/podcast/research signals, capped at 3 pages per site for variety, and pages with no director role or topic signal are skipped before any extraction call - so the API budget goes to the pages most likely to hold a usable quote. If round 1 comes up thin, round 2 spends more pages; if it finds plenty, round 2 spends fewer.")
+        st.markdown("- Search is DuckDuckGo, so social coverage is weaker than the Muse version (dedicated Instagram/Facebook/Threads search).\n- Pages behind logins or paywalls cannot be read - they show in the Search Log as failed.\n- Deep mode makes one API call per page plus one analysis call: slower, more API credit. That is the cost of detail.\n- Deep Research adds two rounds on top: follow-up searches and a corroboration search per quote. Expect several minutes and the most API credit of any mode.\n- Best-fit spending: sources are ranked by role + full topic phrase + interview/podcast/research signals, capped at 3 pages per site for variety, and pages with no director role or topic signal are skipped before any extraction call - so the API budget goes to the pages most likely to hold a usable quote. If round 1 comes up thin, round 2 spends more pages; if it finds plenty, round 2 spends fewer.\n- No-key engine: without an OpenAI key the app uses free Pollinations AI - no sign-up, no cost, but slower with usage limits. If Pollinations fails on a page, the app falls back to rule-based extraction for that page, and to a counted analysis instead of a written one.")
 
 st.markdown('<div style="text-align:center;color:#8fa1c2;font-size:.8rem;margin-top:30px">Sports Psych Director Scout · Verified quotes from sports directors & club leaders · Psychology × Performance</div>', unsafe_allow_html=True)
