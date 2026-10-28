@@ -1,1056 +1,480 @@
-
-import csv
-import io
-import re
-import json
+import csv, io, json, re, html as H
+import requests, streamlit as st
+from bs4 import BeautifulSoup
+from collections import Counter
 from urllib.parse import urlparse
 
-import requests
-import streamlit as st
-from bs4 import BeautifulSoup
-from ddgs import DDGS
+PROMPT = """You are Sports Psych Director Scout, a research agent.
+Find comments in the ONE source page provided about psychology and performance in sport, made by sports directors and leaders of clubs. Return only verbatim, attributable quotes from that page.
+INCLUDE ONLY: sporting director, technical director, director of football, director of performance, head of performance, club CEO, president, owner, general manager, league/federation/players-association directors for mental health or performance.
+EXCLUDE players, head coaches, sport psychologists, academics, journalists and fans, unless a leader above is quoted (then label SECOND-HAND).
+TOPICS: mental health, mindset, confidence, pressure, fear, psychological safety, resilience, culture and values, character/psychology in recruitment, sleep and recovery, mental skills training, hiring psychologists, wellbeing as performance infrastructure.
+RULES: quote only words verbatim in the page text. Never invent a quote, name, role, date or fact. Do not repeat the ALREADY COLLECTED list or FINDS SO FAR. Prefer longer, substantive quotes. If nothing qualifies return [].
+OUTPUT: a JSON list only, no commentary:
+[{"speaker":"","role":"","club":"","date":"","quote":"","label":"DIRECT or SECOND-HAND","theme":"","context":"1-2 sentences: what they were discussing and why it matters","source_type":"interview, news, podcast, forum, club site, research, or other"}]"""
 
-# PAGE CONFIGURATION
-st.set_page_config(
-    page_title="Sports Psych Director Scout",
-    page_icon="🧠",
-    layout="wide"
-)
+SYNTH = """You are Sports Psych Director Scout writing the analysis section of a report from the quotes and search stats provided. Write Markdown with headings: ## Themes that recur / ## Patterns and tensions / ## What leaders are actually doing / ## Gaps in this run. Base every claim on the quotes, name speakers, use the stats honestly, do not invent finds."""
 
-# MUSE-INSPIRED DARK DESIGN
-st.markdown("""
-<style>
-.stApp {
-    background: #0b1020;
-    color: #eef4ff;
-}
-.block-container {
-    padding-top: 2rem;
-    max-width: 1250px;
-}
-h1, h2, h3 {
-    color: #f4f8ff !important;
-}
-.eyebrow {
-    color: #31d8e9;
-    letter-spacing: 3px;
-    font-weight: 700;
-    font-size: 12px;
-}
-.panel {
-    background: #131e36;
-    border: 1px solid #2b3c59;
-    border-radius: 16px;
-    padding: 18px;
-    margin: 8px 0 18px;
-}
-.subtle {
-    color: #a9b8d2;
-    font-size: 13px;
-}
-div[data-testid="stMetric"] {
-    background: #182745;
-    border: 1px solid #30486e;
-    padding: 16px;
-    border-radius: 14px;
-}
-a {
-    color: #42dbe9 !important;
-}
-</style>
-""", unsafe_allow_html=True)
+SYNTH_DEEP = """You are Sports Psych Director Scout writing the deep-research analysis for a report, from the quotes and search stats provided. Write a thorough Markdown report with these headings, in order:
+## Executive summary - 4-6 sentences: the single most important finding, who said it, and what it means.
+## Key findings - one subsection per major finding, each naming the speakers and clubs behind it and quoting the strongest line.
+## Themes that recur - patterns across speakers, sports and countries, with evidence.
+## Tensions and contradictions - where leaders disagree or where practice contradicts stated belief; name both sides.
+## What leaders are actually doing - concrete actions (hiring, structures, routines, recruitment rules), not slogans.
+## Source quality - which kinds of sources were strongest (interviews, podcasts, research, club sites) and where the evidence is thin.
+## Gaps in this run - topics or voices not found, pages that could not be read, and the 3 most valuable follow-up questions for the next run.
+Base every claim on the quotes. Name speakers. Use the stats honestly. Do not invent finds."""
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0"
-}
+SEEN = ["James Bunce - AS Monaco - neck down / under-tapped psychology",
+"Chris Markham - Huddersfield - psychology shaped everything / England penalties",
+"Rasmus Ankersen - Brentford - sleep better, perform better",
+"Haslam / Caulfield - Brentford - mindset, safety, fear",
+"FC Nordsjaelland - psychology like tactical, physical, technical",
+"Chris O'Loughlin - Union SG - culture, values, character scouting",
+"Dan Ashworth - Brighton - psychology drastically under-resourced",
+"William Parham - NBPA - players perform better / wellness is sacred",
+"Dave Brailsford - British Cycling - marginal gains",
+"Adam Beard - Fremantle - integrated performance incl. psychology",
+"Ryan Poles - Chicago Bears - mental skills blind spot",
+"John Lynch - 49ers - mental health is real / full-time clinician",
+"Roger Goodell - NFL - stigma is not weakness",
+"Kevin Cheveldayoff - Winnipeg Jets - mental health doctors",
+"Adam Silver - NBA - loneliness and melancholy",
+"Jeanie Buss - Lakers - nonjudgmental space",
+"Ralf Rangnick - Red Bull - identity brought everyone together",
+"Glen Driscoll - Celtic/Liverpool - productivity paranoia"]
 
-# SEARCH ONLINE
-def search_web(query, limit):
-    with DDGS() as ddgs:
-        return list(ddgs.text(query, max_results=limit))
+ROLES = ["sporting director","technical director","director of football","director of performance","head of performance","general manager","club CEO","team president","club owner"]
+TOPICS = ["sports psychology","mental health athletes","mental performance","mindset and performance","psychological safety","culture and character in recruitment","resilience and pressure","sleep and recovery","wellbeing and performance"]
+MODES = {"Quick": {"queries": 6, "pages": 8}, "Standard": {"queries": 14, "pages": 18}, "Deep": {"queries": 28, "pages": 32}, "Deep Research": {"queries": 40, "pages": 40}}
 
-
-# INSPECT ARTICLES AND AUTHORS
-@st.cache_data(ttl=3600, show_spinner=False)
-def inspect_page(url):
-    data = {
-        "author": "Not identified",
-        "author_profile": "",
-        "author_bio": "",
-        "publication": urlparse(url).netloc,
-        "published": "Not identified",
-        "page_text": "",
-        "status": "Unavailable"
-    }
-
+def web_search(q, n=5):
     try:
-        response = requests.get(
-            url,
-            headers=HEADERS,
-            timeout=12
-        )
-        response.raise_for_status()
+        from ddgs import DDGS
+        with DDGS() as d:
+            hits = list(d.text(q, max_results=n))
+        return [{"title": h.get("title",""), "url": h.get("href",""), "snippet": h.get("body","")} for h in hits if h.get("href")]
+    except Exception as e:
+        return {"error": str(e)}
 
-        if "text/html" not in response.headers.get(
-            "Content-Type", "text/html"
-        ):
-            data["status"] = "Not an HTML page"
-            return data
+def fetch_text(url, limit=16000):
+    try:
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 (Scout/3.0)"})
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        for t in soup(["script","style","nav","footer","header","aside"]):
+            t.decompose()
+        return re.sub(r"\s+", " ", soup.get_text(" ")).strip()[:limit], ""
+    except Exception as e:
+        return "", str(e)[:120]
 
-        soup = BeautifulSoup(
-            response.text[:1500000],
-            "html.parser"
-        )
+def norm(t):
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", str(t).lower())).strip()
 
-        def meta(*names):
-            for name in names:
-                tag = (
-                    soup.find("meta", attrs={"name": name})
-                    or soup.find(
-                        "meta",
-                        attrs={"property": name}
-                    )
-                )
-                if tag and tag.get("content"):
-                    return tag["content"].strip()
-            return ""
+def verify(quote, page):
+    q, p = norm(quote), norm(page)
+    if not q or not p: return False
+    if q in p: return True
+    w = q.split()
+    if len(w) > 12 and " ".join(w[:12]) in p: return True
+    if len(w) > 24 and " ".join(w[len(w)//2:len(w)//2+10]) in p: return True
+    return False
 
-        data["author"] = (
-            meta(
-                "author",
-                "article:author",
-                "parsely-author"
-            )
-            or "Not identified"
-        )
+def llm(key, model, system, user):
+    from openai import OpenAI
+    r = OpenAI(api_key=key).chat.completions.create(model=model, temperature=0,
+        messages=[{"role":"system","content":system},{"role":"user","content":user}])
+    return r.choices[0].message.content.strip()
 
-        data["published"] = (
-            meta(
-                "article:published_time",
-                "datePublished",
-                "date",
-                "pubdate"
-            )
-            or "Not identified"
-        )
+def extract(key, model, url, text, so_far):
+    user = ("ALREADY COLLECTED (do not repeat):\n- " + "\n- ".join(SEEN)
+        + "\n\nFINDS SO FAR (do not repeat):\n- "
+        + ("\n- ".join(f"{f['speaker']}: {f['quote'][:60]}" for f in so_far) or "none")
+        + f"\n\nSOURCE PAGE: {url}\n\nPAGE TEXT:\n" + text[:14000])
+    raw = llm(key, model, PROMPT, user).removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        d = json.loads(raw)
+        return d if isinstance(d, list) else []
+    except json.JSONDecodeError:
+        return []
 
-        data["publication"] = (
-            meta("og:site_name")
-            or data["publication"]
-        )
+def build_queries(sport, region, topics, target, forums, podcasts, research, limit):
+    qs, s = [], "" if sport == "All sports" else sport
+    rg = "" if region == "Global" else region
+    for topic in topics:
+        for role in ROLES[:5]:
+            qs.append(" ".join(x for x in [role, s, rg, topic, "interview"] if x))
+    if podcasts:
+        for topic in topics:
+            qs.append(" ".join(x for x in ["sporting director", s, topic, "podcast"] if x))
+            qs.append(" ".join(x for x in ["director of performance", s, topic, "podcast interview"] if x))
+    if forums:
+        for topic in topics:
+            qs.append(f"site:reddit.com {s} director {topic}".strip())
+            qs.append(f"forum {s} sporting director {topic}".strip())
+    if research:
+        for topic in topics:
+            qs.append(f"performance directors interview study {topic} elite sport")
+    if target:
+        for topic in topics:
+            qs.append(f"{target} {topic} director performance")
+        qs.append(f"{target} sports psychology")
+    out, seen = [], set()
+    for q in qs:
+        q = re.sub(r"\s+", " ", q).strip()
+        if q and q.lower() not in seen:
+            seen.add(q.lower()); out.append(q)
+    return out[:limit]
 
-        # LOOK FOR STRUCTURED AUTHOR INFORMATION
-        for node in soup.find_all(
-            "script",
-            type="application/ld+json"
-        ):
-            try:
-                obj = json.loads(
-                    node.string or node.get_text()
-                )
+def followup_queries(results, topics, sport, target, limit=24):
+    """Round 2: chase the leads round 1 found - the people, clubs and topics with no quotes yet."""
+    qs, s = [], "" if sport == "All sports" else sport
+    top = [name for name, _ in Counter(r.get("speaker", "") for r in results if r.get("speaker")).most_common(6)]
+    for name in top:
+        club = next((r.get("club", "") for r in results if r.get("speaker") == name and r.get("club")), "")
+        for topic in topics[:2]:
+            qs.append(f"{name} {topic} interview")
+            if club: qs.append(f"{name} {club} {topic}")
+    covered = norm(" ".join(r.get("theme", "") + " " + r.get("context", "") for r in results))
+    for topic in topics:
+        if topic.split()[0] not in covered:
+            qs.append(" ".join(x for x in ["sporting director", s, topic, "interview"] if x))
+            qs.append(" ".join(x for x in ["director of performance", s, topic, "podcast"] if x))
+    if target:
+        for name in top: qs.append(f"{target} {name} psychology performance")
+    out, seen = [], set()
+    for q in qs:
+        q = re.sub(r"\s+", " ", q).strip()
+        if q and q.lower() not in seen:
+            seen.add(q.lower()); out.append(q)
+    return out[:limit]
 
-                items = obj if isinstance(obj, list) else [obj]
+def corroborate(results, log):
+    """Round 3: for each quote, search its exact words + speaker; a second, different source confirms it."""
+    n = 0
+    for r in results[:25]:
+        words = re.sub(r"\s+", " ", str(r.get("quote", ""))).split()[:10]
+        if len(words) < 6 or not r.get("speaker"): continue
+        res = web_search(f"\"{' '.join(words)}\" {r['speaker']}", 3)
+        if isinstance(res, dict): continue
+        src_dom = urlparse(str(r.get("url", ""))).netloc.replace("www.", "")
+        for h in res:
+            dom = urlparse(h["url"]).netloc.replace("www.", "")
+            if dom and dom != src_dom:
+                r["corroborated"] = True; r["corroborated_by"] = dom; n += 1
+                log["sources"].append({"url": h["url"], "status": f"corroborates quote by {r.get('speaker','')}"})
+                break
+    return n
 
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
+def research_round(key, model, queries, log, results, max_pages, topics, status, label, sport="", target=""):
+    """One research round: search the queries, read the best-fit new pages, extract quotes."""
+    status.write(label)
+    hits = []
+    for q in queries:
+        res = web_search(q, 5)
+        if isinstance(res, dict) and "error" in res:
+            log["sources"].append({"url": f"SEARCH FAILED: {q}", "status": res["error"]}); continue
+        for h in res:
+            if h["url"] not in log["seen_urls"]:
+                log["seen_urls"].add(h["url"]); h["score"] = score_hit(h, topics, sport, target); hits.append(h)
+    hits.sort(key=lambda h: h["score"], reverse=True)
+    picked, doms = [], Counter()
+    for h in hits:
+        d = urlparse(h["url"]).netloc.replace("www.", "")
+        if doms[d] < 3: picked.append(h); doms[d] += 1
+        if len(picked) >= max_pages: break
+    if len(picked) < max_pages:
+        for h in hits:
+            if h not in picked: picked.append(h)
+            if len(picked) >= max_pages: break
+    hits = picked
+    status.write(f"{label} - {len(queries)} searches, {len(hits)} best-fit pages to read.")
+    for h in hits:
+        text, err = fetch_text(h["url"])
+        if not text:
+            log["pages_failed"] += 1; log["sources"].append({"url": h["url"], "status": f"could not read ({err or 'empty'})"}); continue
+        if not page_fits(text, topics):
+            log["pages_skipped"] = log.get("pages_skipped", 0) + 1
+            log["sources"].append({"url": h["url"], "status": "skipped - no director role or topic signal, extraction call saved"})
+            continue
+        log["pages_read"] += 1; log["sources"].append({"url": h["url"], "status": f"read, {len(text)} characters"})
+        try: found = extract(key, model, h["url"], text, results)
+        except Exception as e: status.write(f"Extraction failed on {h['url']}: {e}"); found = []
+        for r in found:
+            if isinstance(r, dict) and r.get("quote") and r.get("speaker"):
+                r["url"] = h["url"]; r["verified"] = verify(r["quote"], text); results.append(r)
+    ded, keys = [], set()
+    for r in results:
+        k = (r["speaker"].lower(), norm(r["quote"])[:60])
+        if k not in keys: keys.add(k); ded.append(r)
+    return ded
 
-                    if "@graph" in item:
-                        items.extend(
-                            x for x in item["@graph"]
-                            if isinstance(x, dict)
-                        )
+def score_hit(h, topics, sport="", target=""):
+    """Best-fit ranking: a page scores for naming a director role, matching a full topic phrase, being an interview/podcast/research piece, and matching the target. Forum hits score lower."""
+    title, snip = h["title"].lower(), h["snippet"].lower()
+    s = 0
+    for r in ROLES:
+        if r in title: s += 4
+        elif r in snip: s += 2
+    for x in topics:
+        if x in title: s += 3
+        elif x in snip: s += 2
+        elif x.split()[0] in snip: s += 1
+    if "interview" in title or "podcast" in title: s += 3
+    elif "interview" in snip or "podcast" in snip: s += 1
+    if "study" in title or "research" in title: s += 2
+    if target and target.lower() in title + " " + snip: s += 3
+    if sport and sport != "All sports" and sport.split()[0].lower() in title: s += 1
+    if "reddit" in snip or "forum" in title: s -= 1
+    return s
 
-                    author = item.get("author")
+def page_fits(text, topics):
+    """Cheap pre-screen before spending an extraction call: the page must name a director role AND touch a chosen topic."""
+    low = text.lower()
+    if len(text) < 800: return False
+    if not any(r in low for r in ROLES): return False
+    return any(x.split()[0] in low for x in topics)
 
-                    if isinstance(author, list):
-                        author = author[0] if author else None
+def to_csv(results):
+    b = io.StringIO(); w = csv.writer(b)
+    w.writerow(["speaker","role","club","date","quote","url","label","theme","context","source_type","verified_in_page_text","corroborated","corroborated_by"])
+    for r in results:
+        w.writerow([r.get(k,"") for k in ["speaker","role","club","date","quote","url","label","theme","context","source_type","verified","corroborated","corroborated_by"]])
+    return b.getvalue()
 
-                    if isinstance(author, dict):
-                        data["author"] = (
-                            author.get("name")
-                            or data["author"]
-                        )
-                        data["author_profile"] = (
-                            author.get("url") or ""
-                        )
-                        data["author_bio"] = (
-                            author.get("description") or ""
-                        )
+def to_md(results, synthesis, sport, topics, log):
+    L = [f"# Sports Psych Director Scout - detailed run", f"Sport: {sport} | Topics: {', '.join(topics)}",
+         f"Queries: {len(log['queries'])} | Pages read: {log['pages_read']} | Failed: {log['pages_failed']} | Skipped (no signal): {log.get('pages_skipped', 0)} | Quotes: {len(results)} | Rounds: {log.get('rounds', 1)} | Corroborated: {sum(1 for r in results if r.get('corroborated'))}\n"]
+    for i, r in enumerate(results, 1):
+        L.append(f"## {i}. {r.get('speaker','')} - {r.get('role','')}, {r.get('club','')}")
+        if r.get("date"): L.append(f"- Date: {r['date']}")
+        L.append(f"> \"{r.get('quote','')}\"")
+        L.append(f"- Context: {r.get('context','')}")
+        L.append(f"- Source: {r.get('url','')} ({r.get('source_type','')})")
+        L.append(f"- Label: {r.get('label','')} | Theme: {r.get('theme','')} | Verified in page text: {r.get('verified','')} | Corroborated: {r.get('corroborated','')}" + (f" by {r['corroborated_by']}" if r.get("corroborated_by") else "") + "\n")
+    if synthesis: L.append(synthesis)
+    L.append("\n## Search log")
+    for rnd, qs in enumerate(log.get("queries_by_round", [log["queries"]]), 1):
+        L.append(f"\n### Round {rnd}")
+        for q in qs: L.append(f"- {q}")
+    L.append("\n## Sources")
+    for s in log["sources"]: L.append(f"- {s['url']} - {s['status']}")
+    return "\n".join(L)
+# ---------- UI: modern dark tech theme, 01 Configure > 02 Run > 03 Results ----------
+st.set_page_config(page_title="Sports Psych Director Scout", page_icon="🧠", layout="wide", initial_sidebar_state="expanded")
+st.markdown("""<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;600&display=swap');
+:root{--line:#1e2a44;--mut:#8fa1c2;--cy:#22d3ee;--vi:#a78bfa;--gr:#34d399;--am:#fbbf24}
+.stApp{background:radial-gradient(900px 480px at 12% -8%,rgba(34,211,238,.16),transparent 60%),radial-gradient(900px 520px at 88% -10%,rgba(167,139,250,.15),transparent 60%),#070b16;color:#e8eefc;font-family:'Inter',sans-serif}
+h1,h2,h3{font-family:'Space Grotesk',sans-serif !important}
+#MainMenu,footer{visibility:hidden}
+section[data-testid="stSidebar"]{background:#0a1120;border-right:1px solid var(--line)}
+div[data-testid="stMetric"]{background:#111a2e;border:1px solid var(--line);border-radius:14px;padding:14px 16px}
+.stButton>button{background:linear-gradient(90deg,var(--cy),var(--vi));color:#06121f !important;font-weight:700;border:none;border-radius:12px;padding:.65rem 1.4rem}
+button[data-baseweb="tab"]{background:#0d1424;color:var(--mut);border:1px solid var(--line);border-radius:12px 12px 0 0;padding:.55rem 1rem;font-weight:600}
+button[data-baseweb="tab"][aria-selected="true"]{color:#e8eefc;border-color:var(--cy)}
+.hero{border:1px solid var(--line);border-radius:22px;padding:32px 34px;background:linear-gradient(135deg,rgba(34,211,238,.12),rgba(167,139,250,.10) 55%,rgba(13,20,36,.4));margin-bottom:20px}
+.hero .k{color:var(--cy);font-weight:700;letter-spacing:.22em;font-size:.7rem;text-transform:uppercase}
+.hero h1{font-size:2.4rem;margin:.3rem 0;line-height:1.05}
+.hero p{color:var(--mut);max-width:800px;margin:0}
+.pill{display:inline-block;border:1px solid var(--line);background:rgba(17,26,46,.75);border-radius:999px;padding:.25rem .75rem;font-size:.78rem;margin:14px .3rem 0 0}
+.pill b{color:var(--cy)}
+.shead{display:flex;gap:12px;align-items:flex-start;margin:24px 0 4px}
+.snum{font-family:'Space Grotesk';font-weight:700;font-size:.82rem;color:#06121f;background:linear-gradient(135deg,var(--cy),var(--vi));border-radius:10px;padding:.4rem .55rem}
+.shead h2{margin:0;font-size:1.35rem}.shead p{color:var(--mut);margin:.1rem 0 0;font-size:.9rem}
+.qc{background:linear-gradient(180deg,#111a2e,#0d1424);border:1px solid var(--line);border-left:4px solid var(--cy);border-radius:16px;padding:16px 18px;margin:0 0 12px}
+.qc .top{display:flex;gap:10px;align-items:center}
+.av{width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,var(--cy),var(--vi));display:flex;align-items:center;justify-content:center;font-weight:700;color:#06121f}
+.qc .who{font-weight:700}.qc .role{color:var(--mut);font-size:.84rem}
+.qc blockquote{border:none;margin:6px 0;padding:0;font-size:1.02rem;line-height:1.5}
+.qc .ctx{color:var(--mut);font-size:.9rem}
+.b{display:inline-block;border-radius:999px;padding:.14rem .6rem;font-size:.72rem;font-weight:700;margin-right:.3rem}
+.ok{background:rgba(52,211,153,.15);color:var(--gr);border:1px solid rgba(52,211,153,.45)}
+.fl{background:rgba(251,191,36,.12);color:var(--am);border:1px solid rgba(251,191,36,.45)}
+.th{background:rgba(167,139,250,.13);color:var(--vi);border:1px solid rgba(167,139,250,.45)}
+.ty{background:rgba(34,211,238,.1);color:var(--cy);border:1px solid rgba(34,211,238,.4)}
+.co{background:rgba(34,211,238,.14);color:var(--cy);border:1px solid rgba(34,211,238,.5)}
+.qc a{color:var(--cy);font-size:.85rem;font-weight:600;text-decoration:none}
+.empty{border:1px dashed var(--line);border-radius:16px;padding:24px;text-align:center;color:var(--mut)}
+</style>""", unsafe_allow_html=True)
 
-                    elif isinstance(author, str):
-                        data["author"] = author
+def esc(v): return H.escape(str(v or ""))
+def shead(n, t, d):
+    st.markdown(f'<div class="shead"><div class="snum">{esc(n)}</div><div><h2>{esc(t)}</h2><p>{esc(d)}</p></div></div>', unsafe_allow_html=True)
+def initials(name):
+    p = [x for x in re.split(r"\s+", str(name).strip()) if x]
+    return "?" if not p else (p[0][:2].upper() if len(p) == 1 else (p[0][0] + p[-1][0]).upper())
+def quote_card(r):
+    badge = '<span class="b ok">✓ Verified in page text</span>' if r.get("verified") else '<span class="b fl">⚠ Flagged - check source</span>'
+    cor = f'<span class="b co">✓ Corroborated by {esc(r.get("corroborated_by"))}</span>' if r.get("corroborated") else ""
+    th = f'<span class="b th">{esc(r.get("theme"))}</span>' if r.get("theme") else ""
+    ty = f'<span class="b ty">{esc(r.get("source_type"))}</span>' if r.get("source_type") else ""
+    dt = f' · {esc(r.get("date"))}' if r.get("date") else ""
+    link = f'<a href="{esc(r.get("url"))}" target="_blank">Open the original source</a>' if r.get("url") else ""
+    st.markdown(f"""<div class="qc"><div class="top"><div class="av">{esc(initials(r.get('speaker')))}</div>
+<div><div class="who">{esc(r.get('speaker'))}</div><div class="role">{esc(r.get('role'))} · {esc(r.get('club'))}{dt}</div></div></div>
+<blockquote>&ldquo;{esc(r.get('quote'))}&rdquo;</blockquote><p class="ctx">{esc(r.get('context'))}</p>
+<div>{badge}{cor}{th}{ty}</div><div style="margin-top:6px">{link}</div></div>""", unsafe_allow_html=True)
+def empty(t, x): st.markdown(f'<div class="empty"><b>{esc(t)}</b><br>{esc(x)}</div>', unsafe_allow_html=True)
 
-                    data["published"] = (
-                        item.get("datePublished")
-                        or data["published"]
-                    )
-
-            except Exception:
-                pass
-
-        # EXTRACT ARTICLE TEXT
-        for tag in soup([
-            "script", "style", "nav",
-            "footer", "header"
-        ]):
-            tag.decompose()
-
-        main = (
-            soup.find("article")
-            or soup.find("main")
-            or soup.body
-            or soup
-        )
-
-        data["page_text"] = " ".join(
-            main.stripped_strings
-        )[:18000]
-
-        data["status"] = "Read"
-
-    except Exception as exc:
-        data["status"] = (
-            f"Could not read: {type(exc).__name__}"
-        )
-
-    return data
-
-
-# EXTRACT RELEVANT PASSAGES
-def extract_evidence(text, keywords):
-    sentences = re.split(
-        r"(?<=[.!?])\s+",
-        text
-    )
-
-    matches = [
-        sentence.strip()
-        for sentence in sentences
-        if 45 <= len(sentence) <= 450
-        and any(
-            word.lower() in sentence.lower()
-            for word in keywords
-        )
-    ]
-
-    return matches[:3]
-
-
-# DASHBOARD HEADER
-st.markdown(
-    '<div class="eyebrow">'
-    'AI RESEARCH AGENT · SPORT PSYCHOLOGY'
-    '</div>',
-    unsafe_allow_html=True
-)
-
-st.title("🧠 Sports Psych Director Scout")
-
-st.caption(
-    "Discover what sports directors and club leaders "
-    "say about psychology and performance, "
-    "with sources and author attribution."
-)
-
-st.markdown(
-    "**01 Configure　　"
-    "02 Search · Read　　"
-    "03 Evidence · Analysis · Downloads**"
-)
-
-
-# SIDEBAR CONTROLS
 with st.sidebar:
-    st.header("Research Settings")
-
-    query = st.text_input(
-        "Search topic",
-        "sports directors mental performance"
-    )
-
-    keywords = st.text_input(
-        "Evidence keywords",
-        "psychology, mental, mindset, "
-        "performance, confidence, pressure"
-    )
-
-    max_results = st.slider(
-        "Search results",
-        3, 20, 8
-    )
-
-    read_pages = st.checkbox(
-        "Read public article pages",
-        value=True
-    )
-
-    st.caption(
-        "Research public sources only. "
-        "Verify quotations against originals."
-    )
-
-    run = st.button(
-        "🔎 Run Research",
-        type="primary",
-        use_container_width=True
-    )
-
-
-# STORE RESULTS
-if "records" not in st.session_state:
-    st.session_state.records = []
-
-if "last_query" not in st.session_state:
-    st.session_state.last_query = ""
-
-
-# RUN RESEARCH
-if run:
+    st.markdown("### ⚙️ Control panel")
+    st.caption("Your key and model live here. Everything else is set in step 01.")
+    dkey = ""
     try:
-        with st.spinner(
-            "Searching and reviewing sources..."
-        ):
-            hits = search_web(query, max_results)
-            records = []
-
-            for hit in hits:
-                url = (
-                    hit.get("href")
-                    or hit.get("url")
-                    or ""
-                )
-
-                if not url.startswith("http"):
-                    continue
-
-                if read_pages:
-                    info = inspect_page(url)
-                else:
-                    info = {
-                        "author": "Not identified",
-                        "author_profile": "",
-                        "author_bio": "",
-                        "publication": urlparse(url).netloc,
-                        "published": "Not identified",
-                        "page_text": "",
-                        "status": "Not read"
-                    }
-
-                records.append({
-                    "title": hit.get(
-                        "title", "Untitled"
-                    ),
-                    "url": url,
-                    "snippet": hit.get("body", ""),
-                    "query": query,
-                    **info
-                })
-
-            st.session_state.records = records
-            st.session_state.last_query = query
-
-    except Exception as exc:
-        st.error(f"Search failed: {exc}")
-
-
-records = st.session_state.records
-
-terms = [
-    x.strip()
-    for x in keywords.split(",")
-    if x.strip()
-]
-
-read = [
-    r for r in records
-    if r["status"] == "Read"
-]
-
-evidence = [
-    (r, sentence)
-    for r in read
-    for sentence in extract_evidence(
-        r["page_text"], terms
-    )
-]
-
-verified_quotes = 0
-
-
-# DASHBOARD TABS
-tabs = st.tabs([
-    "📊 Overview",
-    "💬 Evidence",
-    "🧩 Themes & Gaps",
-    "👤 Writers & Sources",
-    "🔎 Search Log",
-    "⬇️ Downloads",
-    "📗 Guide & Scoring",
-    "🌐 Social Media"
-
-])
-
-
-# TAB 1: OVERVIEW
-with tabs[0]:
-    st.subheader("Research Overview")
-
-    a, b, c, d = st.columns(4)
-
-    a.metric(
-        "Sources Found",
-        len(records)
-    )
-
-    b.metric(
-        "Pages Read",
-        len(read)
-    )
-
-    c.metric(
-        "Relevant Passages",
-        len(evidence)
-    )
-
-    d.metric(
-        "Verified Speaker Quotes",
-        verified_quotes
-    )
-
-    st.markdown("#### Research Pipeline")
-
-    columns = st.columns(4)
-
-    steps = [
-        (
-            "Search",
-            "Discover relevant public pages"
-        ),
-        (
-            "Read & Extract",
-            "Find passages and article bylines"
-        ),
-        (
-            "Verify",
-            "Confirm original wording and speakers"
-        ),
-        (
-            "Analyse",
-            "Identify themes and research gaps"
-        )
-    ]
-
-    for column, (title, description) in zip(
-        columns, steps
-    ):
-        with column:
-            st.markdown(
-                f'<div class="panel">'
-                f'<b>{title}</b>'
-                f'<p class="subtle">{description}</p>'
-                f'</div>',
-                unsafe_allow_html=True
-            )
-
-    if not records:
-        st.info(
-            "Use the sidebar to run your first search."
-        )
-
-
-# TAB 2: EVIDENCE
-with tabs[1]:
-    st.subheader("Evidence From Articles")
-
-    st.caption(
-        "These passages match your keywords. "
-        "They are not automatically verified "
-        "quotes from named sports directors."
-    )
-
-    for record, sentence in evidence:
-        with st.container(border=True):
-
-            st.markdown(
-                f'**{record["title"]}**'
-            )
-
-            st.write(sentence)
-
-            st.caption(
-                f'Written by: {record["author"]} '
-                f'· {record["publication"]}'
-            )
-
-            st.link_button(
-                "Open Original Source",
-                record["url"]
-            )
-
-    if not evidence:
-        st.info(
-            "No matching passages yet. "
-            "Run a search or change your keywords."
-        )
-
-
-# TAB 3: THEMES AND GAPS
-with tabs[2]:
-    st.subheader("Themes & Research Gaps")
-
-    themes = {
-        "Mental Health": [
-            "mental health",
-            "wellbeing",
-            "well-being"
-        ],
-        "Confidence": [
-            "confidence",
-            "self-belief"
-        ],
-        "Pressure": [
-            "pressure",
-            "stress",
-            "anxiety"
-        ],
-        "Culture": [
-            "culture",
-            "leadership",
-            "team"
-        ],
-        "Performance": [
-            "performance",
-            "performance psychology"
-        ],
-        "Recovery": [
-            "recovery",
-            "sleep",
-            "rest"
-        ]
-    }
-
-    for theme, words in themes.items():
-
-        count = sum(
-            any(
-                word in sentence.lower()
-                for word in words
-            )
-            for _, sentence in evidence
-        )
-
-        st.progress(
-            min(
-                count / max(len(evidence), 1),
-                1
-            ),
-            text=f"{theme}: {count} matching passages"
-        )
-
-    st.info(
-        "These are keyword counts, "
-        "not AI-generated conclusions."
-    )
-
-
-# TAB 4: WRITERS AND SOURCES
-with tabs[3]:
-    st.subheader("Writers & Sources")
-
-    st.caption(
-        "Discover who wrote an article, "
-        "where it was published, and "
-        "which people were quoted."
-    )
-
-    for record in records:
-
-        with st.expander(record["title"]):
-
-            st.write(
-                "**Written by:**",
-                record["author"]
-            )
-
-            st.write(
-                "**Publication:**",
-                record["publication"]
-            )
-
-            st.write(
-                "**Published:**",
-                record["published"]
-            )
-
-            st.write(
-                "**About the Writer:**",
-                record["author_bio"]
-                or "Biography not available"
-            )
-
-            profile = record["author_profile"]
-
-            if profile.startswith("http"):
-                st.link_button(
-                    "View Author Profile",
-                    profile
-                )
-
-            st.write(
-                "**Sports Director / Person Quoted:** "
-                "Not yet verified"
-            )
-
-            st.write(
-                "**Source Status:**",
-                record["status"]
-            )
-
-            st.link_button(
-                "Read Full Article",
-                record["url"]
-            )
-
-    if not records:
-        st.info(
-            "Run research to discover "
-            "writers and sources."
-        )
-
-
-# TAB 5: SEARCH LOG
-with tabs[4]:
-    st.subheader("Search Log")
-
-    st.write(
-        "**Latest Search:**",
-        st.session_state.last_query
-        or "No search yet"
-    )
-
-    for record in records:
-        st.write(
-            f'{record["status"]} — '
-            f'{record["title"]}'
-        )
-
-        st.write(record["url"])
-
-
-# TAB 6: DOWNLOADS
-with tabs[5]:
-    st.subheader("Download Research")
-
-    if records:
-
-        output = io.StringIO()
-
-        fields = [
-            "title",
-            "url",
-            "author",
-            "author_profile",
-            "author_bio",
-            "publication",
-            "published",
-            "status",
-            "snippet",
-            "query"
-        ]
-
-        writer = csv.DictWriter(
-            output,
-            fieldnames=fields,
-            extrasaction="ignore"
-        )
-
-        writer.writeheader()
-        writer.writerows(records)
-
-        st.download_button(
-            "Download Research CSV",
-            output.getvalue().encode("utf-8-sig"),
-            file_name="sports_psych_sources.csv",
-            mime="text/csv"
-        )
-
-        report = (
-            "# Sports Psych Director Scout\n\n"
-            f'Query: {st.session_state.last_query}\n\n'
-        )
-
-        for record in records:
-            report += (
-                f'## {record["title"]}\n'
-                f'- URL: {record["url"]}\n'
-                f'- Author: {record["author"]}\n'
-                f'- Publication: {record["publication"]}\n'
-                f'- Date: {record["published"]}\n'
-                f'- Status: {record["status"]}\n\n'
-            )
-
-        st.download_button(
-            "Download Research Report",
-            report,
-            file_name="sports_psych_report.md"
-        )
-
+        if "OPENAI_API_KEY" in st.secrets: dkey = st.secrets["OPENAI_API_KEY"]
+    except Exception: dkey = ""
+    api_key = st.text_input("OpenAI API key", type="password", value=dkey, help="Use your own key - it is not saved.")
+    st.success("Key loaded for this session") if api_key else st.warning("No key yet - add one to run")
+    model = st.selectbox("Model", ["gpt-4o", "gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1"], index=0)
+    st.divider(); st.markdown("**The agent's rules**")
+    st.markdown("- Director-level voices only\n- Verbatim quotes, checked in code\n- Nothing already collected\n- Gaps reported, never filled")
+    st.caption("Sports Psych Director Scout · v4.1 best-fit research")
+
+st.markdown("""<div class="hero"><div class="k">AI Research Agent · Sport Psychology</div>
+<h1>🧠 Sports Psych Director Scout</h1>
+<p>It hunts down what <b>sports directors and club leaders</b> actually say about <b>psychology and performance</b> - in interviews, podcasts, forums and media. Every quote is verified against its source. <b>Deep Research</b> goes further: it follows the leads it finds, chases the topics it missed, and checks each quote against a second source.</p>
+<span class="pill"><b>01</b> Configure the run</span><span class="pill"><b>02</b> Search · read · extract</span><span class="pill"><b>03</b> Quotes · analysis · downloads</span></div>""", unsafe_allow_html=True)
+
+shead("01", "Configure your run", "Tell the agent where to look. More topics and Deep mode find more - and take longer.")
+with st.container(border=True):
+    c1, c2 = st.columns(2)
+    with c1:
+        sport = st.selectbox("Sport", ["Football / soccer","NBA (basketball)","NFL (American football)","MLB (baseball)","NHL (ice hockey)","Rugby","AFL (Australian rules)","Cycling","Olympic sport","All sports"])
+        region = st.selectbox("Region", ["Global","UK","Europe","North America","Australia"])
+        target = st.text_input("Target (optional)", placeholder="A club, league or person - e.g. Brighton, NBA, Dan Ashworth")
+    with c2:
+        topics = st.multiselect("Topics", TOPICS, default=["sports psychology", "mental health athletes"])
+        mode_name = st.radio("Run depth", list(MODES.keys()), index=1)
+        if mode_name == "Deep Research":
+            st.info("🔬 Deep Research runs 3 rounds: broad discovery, then follow-up searches on the people and topics it found, then a corroboration check on every quote. Expect several minutes and noticeably more API credit - that is the cost of depth.")
+    t1, t2, t3 = st.columns(3)
+    inc_forums = t1.checkbox("💬 Forums (incl. Reddit)", value=True)
+    inc_pods = t2.checkbox("🎙️ Podcasts & interviews", value=True)
+    inc_res = t3.checkbox("🔬 Research interviews", value=True)
+mode = MODES[mode_name]
+deep = mode_name == "Deep Research"
+
+shead("02", "Run the agent", "It searches, opens the best pages, extracts quotes page by page, checks every quote in code, then writes the analysis. Deep Research adds two more rounds: follow the leads, then corroborate.")
+if st.button("🚀 Run the agent", type="primary", use_container_width=True):
+    if not api_key: st.error("Add an OpenAI API key in the Control panel first."); st.stop()
+    if not topics: st.error("Pick at least one topic in step 01."); st.stop()
+    log = {"queries": [], "queries_by_round": [], "sources": [], "pages_read": 0, "pages_failed": 0, "pages_skipped": 0, "seen_urls": set(), "rounds": 1}
+    status = st.status("Deep research starting..." if deep else "Searching...", expanded=True)
+    results = []
+    # Round 1 - broad discovery
+    q1 = build_queries(sport, region, topics, target, inc_forums, inc_pods, inc_res, mode["queries"])
+    log["queries"] += q1; log["queries_by_round"].append(q1)
+    results = research_round(api_key, model, q1, log, results, mode["pages"], topics, status, "Round 1 of 3 - broad discovery" if deep else "Stage 1 - searching and reading", sport, target)
+    # Round 2 - follow the leads (Deep Research only). Spend more of round 2 where round 1 came up thin.
+    if deep:
+        q2 = followup_queries(results, topics, sport, target)
+        log["queries"] += q2; log["queries_by_round"].append(q2); log["rounds"] = 2
+        r2_pages = 30 if len(results) < 3 else (12 if len(results) >= 10 else 20)
+        status.write(f"Round 1 found {len(results)} quotes - spending round 2 on {r2_pages} pages where it matters most.")
+        results = research_round(api_key, model, q2, log, results, r2_pages, topics, status, "Round 2 of 3 - following leads: the people found, the topics missed", sport, target)
+    # Round 3 - corroborate every quote (Deep Research only)
+    n_cor = 0
+    if deep:
+        log["rounds"] = 3
+        status.write("Round 3 of 3 - corroborating: searching each quote's exact words to find a second source.")
+        n_cor = corroborate(results, log)
+        status.write(f"Corroboration done: {n_cor} of {len(results)} quotes confirmed by a second, independent source.")
+    status.update(label="Writing the analysis..." if deep else "Writing themes and gaps analysis...")
+    synthesis = ""
+    if results:
+        stats = (f"Queries: {len(log['queries'])} across {log['rounds']} round(s). Pages read: {log['pages_read']}. "
+                 f"Failed: {log['pages_failed']}. Skipped (no director/topic signal): {log.get('pages_skipped', 0)}. Corroborated quotes: {n_cor}. Forums: {inc_forums}. Podcasts: {inc_pods}. Research: {inc_res}.")
+        try: synthesis = llm(api_key, model, SYNTH_DEEP if deep else SYNTH, stats + "\n\nQUOTES:\n" + json.dumps(results, indent=1))
+        except Exception as e: synthesis = f"## Themes that recur\n\nAnalysis failed: {e}"
+    status.update(label="Run complete - results are in section 03 below.", state="complete", expanded=False)
+    st.session_state["run"] = {"results": results, "synthesis": synthesis, "log": log, "sport": sport, "topics": topics, "mode": mode_name}
+
+shead("03", "Results", "Six clear sections: overview, quotes, analysis, search log, downloads, and the testing guide.")
+run = st.session_state.get("run")
+results = run["results"] if run else []
+log = run["log"] if run else {"queries": [], "queries_by_round": [], "sources": [], "pages_read": 0, "pages_failed": 0, "pages_skipped": 0, "rounds": 1}
+vcount = sum(1 for r in results if r.get("verified"))
+ccount = sum(1 for r in results if r.get("corroborated"))
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["◈ Overview", "💬 Quotes", "📊 Themes & Gaps", "🔍 Search Log", "⬇️ Downloads", "🧪 Guide & Scoring"])
+
+with tab1:
+    st.markdown("#### Overview — how a run flows, and the headline numbers")
+    st.markdown("**A · Search** role × topic queries across media, podcasts, forums and research &nbsp;→&nbsp; **B · Read & extract** best pages in full, quotes page by page &nbsp;→&nbsp; **C · Verify** every quote checked in code, duplicates filtered &nbsp;→&nbsp; **D · Analyse** themes, tensions, gaps, downloads.")
+    if run and run.get("mode") == "Deep Research":
+        st.markdown("**Deep Research rounds:** 1 · Broad discovery &nbsp;→&nbsp; 2 · Follow the leads (people found, topics missed) &nbsp;→&nbsp; 3 · Corroborate each quote against a second source.")
+    if run:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("New quotes", len(results)); m2.metric("Verified in source", vcount)
+        m3.metric("Pages read", log["pages_read"]); m4.metric("Searches run", len(log["queries"]))
+        st.caption(f"Research rounds: {log.get('rounds', 1)} · Quotes corroborated by a second source: {ccount} · Pages skipped (no director/topic signal): {log.get('pages_skipped', 0)}")
+        if results:
+            st.markdown("#### Strongest finds from this run")
+            best = sorted(results, key=lambda r: (bool(r.get("corroborated")), bool(r.get("verified")), len(r.get("quote", ""))), reverse=True)
+            for r in best[:3]: quote_card(r)
+        else: empty("No quotes this run", "Try Deep Research, different topics, or a named target.")
+    else: empty("No run yet", "Configure in section 01, then hit Run the agent in section 02.")
+
+with tab2:
+    st.markdown("#### Quotes — every new director comment, with context, source and verification badge")
+    if not run: empty("Nothing here yet", "Run the agent and quotes will appear here.")
+    elif not results: empty("No qualifying quotes", "The pages read held no attributable director quotes on these topics.")
     else:
-        st.info(
-            "Run research before downloading."
-        )
-
-
-# TAB 7: GUIDE
-with tabs[6]:
-    st.subheader("Guide & Scoring")
-
-    st.markdown("""
-    ### How the Research Agent Works
-
-    **1. Search**
-
-    Finds publicly available articles and discussions
-    about sports psychology and performance.
-
-    **2. Read**
-
-    Opens accessible pages and extracts relevant text.
-
-    **3. Identify Writers**
-
-    Attempts to identify article authors, publication
-    information, dates, and available author profiles.
-
-    **4. Review Evidence**
-
-    Finds passages containing your research keywords.
-
-    **5. Analyse Themes**
-
-    Counts matching references to topics such as
-    mental health, confidence, pressure, and recovery.
-
-    **6. Export Research**
-
-    Saves collected sources as downloadable reports.
-
-    ### Research Accuracy
-
-    - Article authors are separate from interviewees.
-    - Quotations require original-source verification.
-    - Missing information is marked as unavailable.
-    - Theme counts do not establish scientific conclusions.
-    - Public sources must be used responsibly.
-    """)
-
-
-# SOCIAL MEDIA RESEARCH TAB
-
-with tabs[7]:
-    st.subheader("Social Media Listening")
-
-    st.caption(
-        "Discover public sports conversations on X "
-        "and indexed LinkedIn posts."
-    )
-
-    social_topic = st.text_input(
-        "Sports discussion topic",
-        value="athlete mental health OR mental performance",
-        key="social_topic"
-    )
-
-    platforms = st.multiselect(
-        "Platforms",
-        ["X (Twitter)", "LinkedIn"],
-        default=["X (Twitter)", "LinkedIn"]
-    )
-
-    audiences = st.multiselect(
-        "People to research",
-        [
-            "All public discussions",
-            "Directors and club leaders",
-            "Coaches",
-            "Athletes",
-            "Parents and fans"
-        ],
-        default=["All public discussions"]
-    )
-
-    use_x_api = st.checkbox(
-        "Use official X API (may incur charges)",
-        value=False
-    )
-
-    if st.button("Search Social Media"):
-
-        if not social_topic.strip():
-            st.warning("Enter a search topic.")
-
-        elif not platforms or not audiences:
-            st.warning("Select a platform and audience.")
-
-        else:
-            social_results = []
-            errors = []
-
-            search_topic = social_topic.strip()
-
-            if "All public discussions" not in audiences:
-
-                role_queries = {
-                    "Directors and club leaders":
-                        '"sports director" OR "club director"',
-                    "Coaches": "coach OR coaching",
-                    "Athletes": "athlete OR player",
-                    "Parents and fans": "parent OR fan"
-                }
-
-                roles = [
-                    role_queries[a]
-                    for a in audiences
-                    if a in role_queries
-                ]
-
-                if roles:
-                    search_topic += (
-                        " (" + " OR ".join(roles) + ")"
-                    )
-
-            # DISCOVER INDEXED PUBLIC LINKS
-
-            domains = {
-                "X (Twitter)": "x.com",
-                "LinkedIn": "linkedin.com/posts"
-            }
-
-            with st.spinner("Searching public sources..."):
-
-                for platform in platforms:
-
-                    domain = domains[platform]
-
-                    try:
-                        with DDGS() as searcher:
-                            hits = list(
-                                searcher.text(
-                                    f"site:{domain} {search_topic}",
-                                    max_results=10
-                                )
-                            )
-
-                        for hit in hits:
-
-                            url = (
-                                hit.get("href")
-                                or hit.get("url")
-                                or ""
-                            )
-
-                            if not url.startswith("http"):
-                                continue
-
-                            social_results.append({
-                                "platform": platform,
-                                "type": "Indexed search preview",
-                                "author": "Not verified",
-                                "role": "Not verified",
-                                "title": hit.get(
-                                    "title", "Public discussion"
-                                ),
-                                "text": hit.get("body", ""),
-                                "url": url
-                            })
-
-                    except Exception as error:
-                        errors.append(
-                            f"{platform}: {error}"
-                        )
-
-            # OPTIONAL OFFICIAL X API
-
-            if "X (Twitter)" in platforms and use_x_api:
-
-                try:
-                    token = st.secrets.get(
-                        "X_BEARER_TOKEN", ""
-                    )
-                except Exception:
-                    token = ""
-
-                if not token:
-                    st.warning(
-                        "Add X_BEARER_TOKEN to "
-                        "Streamlit Secrets first."
-                    )
-
-                else:
-                    try:
-                        response = requests.get(
-                            "https://api.x.com/2/tweets/search/recent",
-                            headers={
-                                "Authorization": f"Bearer {token}"
-                            },
-                            params={
-                                "query":
-                                    f"({social_topic}) lang:en "
-                                    "-is:retweet",
-                                "max_results": 25,
-                                "tweet.fields":
-                                    "author_id,created_at",
-                                "expansions": "author_id",
-                                "user.fields":
-                                    "name,username,description"
-                            },
-                            timeout=20
-                        )
-
-                        response.raise_for_status()
-
-                        payload = response.json()
-
-                        users = {
-                            user["id"]: user
-                            for user in payload.get(
-                                "includes", {}
-                            ).get("users", [])
-                        }
-
-                        for post in payload.get("data", []):
-
-                            author = users.get(
-                                post.get("author_id"), {}
-                            )
-
-                            username = author.get(
-                                "username", ""
-                            )
-
-                            link = (
-                                f"https://x.com/{username}/"
-                                f"status/{post['id']}"
-                                if username else
-                                f"https://x.com/i/web/status/"
-                                f"{post['id']}"
-                            )
-
-                            social_results.append({
-                                "platform": "X (Twitter)",
-                                "type": "X API post or reply",
-                                "author": author.get(
-                                    "name", "Not identified"
-                                ),
-                                "role": "Not independently verified",
-                                "title": "Public X discussion",
-                                "text": post.get("text", ""),
-                                "url": link,
-                                "bio": author.get(
-                                    "description", ""
-                                ),
-                                "date": post.get(
-                                    "created_at", ""
-                                )
-                            })
-
-                    except Exception as error:
-                        errors.append(f"X API: {error}")
-
-            # REMOVE DUPLICATES
-
-            unique = {}
-
-            for result in social_results:
-                unique[result["url"]] = result
-
-            st.session_state["social_results"] = list(
-                unique.values()
-            )
-
-            st.session_state["social_errors"] = errors
-
-    # DISPLAY RESULTS
-
-    for error in st.session_state.get(
-        "social_errors", []
-    ):
-        st.warning(error)
-
-    results = st.session_state.get(
-        "social_results", []
-    )
-
-    st.metric("Social Sources Found", len(results))
-
-    for result in results:
-
-        with st.container(border=True):
-
-            st.markdown(
-                f"**{result['platform']} — "
-                f"{result['type']}**"
-            )
-
-            st.write(result["title"])
-            st.write(result["text"])
-
-            st.write(
-                "**Writer:**", result["author"]
-            )
-
-            st.write(
-                "**Professional Role:**", result["role"]
-            )
-
-            if result.get("bio"):
-                st.write(
-                    "**About the Writer:**",
-                    result["bio"]
-                )
-
-            if result.get("date"):
-                st.write(
-                    "**Posted:**", result["date"]
-                )
-
-            st.link_button(
-                "View Original Source",
-                result["url"]
-            )
-
-    if not results:
-        st.info(
-            "Run a social search to discover "
-            "posts and discussions."
-        )
-
+        f1, f2, f3 = st.columns(3)
+        tf = f1.selectbox("Filter by theme", ["All themes"] + sorted({r.get("theme","") for r in results if r.get("theme")}))
+        vonly = f2.checkbox("✓ Verified only", value=False)
+        nf = f3.text_input("Filter by name or club", "")
+        shown = results
+        if tf != "All themes": shown = [r for r in shown if r.get("theme") == tf]
+        if vonly: shown = [r for r in shown if r.get("verified")]
+        if nf: shown = [r for r in shown if nf.lower() in (r.get("speaker","") + " " + r.get("club","")).lower()]
+        st.caption(f"Showing {len(shown)} of {len(results)} quotes")
+        for r in shown: quote_card(r)
+        if not shown: empty("No quotes match those filters", "Loosen a filter to see the full set.")
+
+with tab3:
+    st.markdown("#### Themes & Gaps — what recurs, where leaders differ, what they are doing, and what the run missed")
+    if not run: empty("No analysis yet", "Written at the end of each run, from the quotes it found.")
+    elif not results: empty("No analysis - no quotes found", "The agent reports the gap instead of inventing themes.")
     else:
-        import io
-        import csv
+        with st.container(border=True): st.markdown(run["synthesis"] or "The analysis step returned nothing.")
 
-        output = io.StringIO()
+with tab4:
+    st.markdown("#### Search Log — every search run, and every source read or failed")
+    if not run: empty("No log yet", "After a run, every query and source will be listed here.")
+    else:
+        st.markdown(f"**Searches run ({len(log['queries'])}) across {log.get('rounds', 1)} round(s)**")
+        with st.container(border=True):
+            for rnd, qs in enumerate(log.get("queries_by_round", [log["queries"]]), 1):
+                st.markdown(f"**Round {rnd}**")
+                for q in qs: st.markdown(f"- `{q}`")
+        st.markdown(f"**Sources ({len(log['sources'])}) — read: {log['pages_read']} · failed: {log['pages_failed']} · skipped (no director/topic signal): {log.get('pages_skipped', 0)}**")
+        with st.container(border=True):
+            for s in log["sources"]:
+                icon = "✅" if s["status"].startswith("read") else "❌"
+                st.markdown(f"- {icon} {s['url']} — *{s['status']}*")
 
-        fields = [
-            "platform", "type", "author",
-            "role", "title", "text",
-            "url", "bio", "date"
-        ]
+with tab5:
+    st.markdown("#### Downloads — a readable report for people, a spreadsheet for analysis")
+    d1, d2 = st.columns(2)
+    with d1:
+        with st.container(border=True):
+            st.markdown("**📄 Full report (Markdown)**\n\nEvery quote with context and source, the analysis, search log and sources.")
+            if run: st.download_button("⬇️ Download the report", data=to_md(results, run["synthesis"], run["sport"], run["topics"], log), file_name="scout-report.md", mime="text/markdown", use_container_width=True)
+            else: st.caption("Available after a run.")
+    with d2:
+        with st.container(border=True):
+            st.markdown("**📊 Quotes spreadsheet (CSV)**\n\nOne row per quote: speaker, role, club, quote, source, theme, verification.")
+            if run: st.download_button("⬇️ Download the CSV", data=to_csv(results), file_name="scout-quotes.csv", mime="text/csv", use_container_width=True)
+            else: st.caption("Available after a run.")
 
-        writer = csv.DictWriter(
-            output,
-            fieldnames=fields,
-            extrasaction="ignore"
-        )
+with tab6:
+    st.markdown("#### Guide & Scoring — how to judge a run, and what is already collected")
+    with st.container(border=True):
+        st.markdown("1. **Attribution** - real director/leader, role and club on every quote.\n2. **Verbatim** - open 2 sources; the words must be there.\n3. **No fabrication** - no quote, date or URL you cannot find.\n4. **De-duplication** - nothing in the collected list below.\n5. **Role discipline** - no players/coaches as directors.\n6. **Gap honesty** - check Themes & Gaps and the Search Log.\n7. **Usefulness** - would a researcher keep half of these?")
+    with st.expander("📚 Already collected - the agent will not repeat these"):
+        for item in SEEN: st.markdown(f"- {item}")
+    with st.expander("ℹ️ Honest limits of this web version"):
+        st.markdown("- Search is DuckDuckGo, so social coverage is weaker than the Muse version (dedicated Instagram/Facebook/Threads search).\n- Pages behind logins or paywalls cannot be read - they show in the Search Log as failed.\n- Deep mode makes one API call per page plus one analysis call: slower, more API credit. That is the cost of detail.\n- Deep Research adds two rounds on top: follow-up searches and a corroboration search per quote. Expect several minutes and the most API credit of any mode.\n- Best-fit spending: sources are ranked by role + full topic phrase + interview/podcast/research signals, capped at 3 pages per site for variety, and pages with no director role or topic signal are skipped before any extraction call - so the API budget goes to the pages most likely to hold a usable quote. If round 1 comes up thin, round 2 spends more pages; if it finds plenty, round 2 spends fewer.")
 
-        writer.writeheader()
-        writer.writerows(results)
-
-        st.download_button(
-            "Download Social Research CSV",
-            output.getvalue().encode("utf-8-sig"),
-            file_name="social_research.csv",
-            mime="text/csv"
-        )
-
+st.markdown('<div style="text-align:center;color:#8fa1c2;font-size:.8rem;margin-top:30px">Sports Psych Director Scout · Verified quotes from sports directors & club leaders · Psychology × Performance</div>', unsafe_allow_html=True)
