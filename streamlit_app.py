@@ -399,6 +399,23 @@ button[data-baseweb="tab"][aria-selected="true"]{color:#e8eefc;border-color:var(
 .empty{border:1px dashed var(--line);border-radius:16px;padding:24px;text-align:center;color:var(--mut)}
 </style>""", unsafe_allow_html=True)
 
+# ---------- Password gate (v4.4): password lives in Streamlit Secrets, never in the code ----------
+def _secret(name):
+    try: return st.secrets.get(name, "")
+    except Exception: return ""
+APP_PASSWORD = _secret("APP_PASSWORD")
+if APP_PASSWORD and not st.session_state.get("authed"):
+    st.markdown("""<div class="hero"><div class="k">Private app</div>
+<h1>🔒 Sports Psych Director Scout</h1>
+<p>This app is password protected. Enter the password to continue.</p></div>""", unsafe_allow_html=True)
+    _pw = st.text_input("Password", type="password", key="pw_in")
+    if st.button("Unlock", type="primary"):
+        if _pw == APP_PASSWORD:
+            st.session_state["authed"] = True; st.rerun()
+        else:
+            st.error("Wrong password - try again.")
+    st.stop()
+
 def esc(v): return H.escape(str(v or ""))
 def shead(n, t, d):
     st.markdown(f'<div class="shead"><div class="snum">{esc(n)}</div><div><h2>{esc(t)}</h2><p>{esc(d)}</p></div></div>', unsafe_allow_html=True)
@@ -432,7 +449,11 @@ with st.sidebar:
     model = st.selectbox("Model", ["gpt-4o", "gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1"], index=0)
     st.divider(); st.markdown("**The agent's rules**")
     st.markdown("- Director-level voices only\n- Verbatim quotes, checked in code\n- Nothing already collected\n- Gaps reported, never filled")
-    st.caption("Sports Psych Director Scout · v4.3 Pollinations (free, no key)")
+    if APP_PASSWORD and st.session_state.get("authed"):
+        if st.button("🔒 Log out", use_container_width=True):
+            st.session_state["authed"] = False; st.rerun()
+    if not APP_PASSWORD: st.caption("🔓 No password set - anyone with the link can open this app. Set APP_PASSWORD in Streamlit Secrets to lock it.")
+    st.caption("Sports Psych Director Scout · v4.4 password login")
 
 st.markdown("""<div class="hero"><div class="k">AI Research Agent · Sport Psychology</div>
 <h1>🧠 Sports Psych Director Scout</h1>
@@ -579,6 +600,6 @@ with tab6:
     with st.expander("📚 Already collected - the agent will not repeat these"):
         for item in SEEN: st.markdown(f"- {item}")
     with st.expander("ℹ️ Honest limits of this web version"):
-        st.markdown("- Search is DuckDuckGo, so social coverage is weaker than the Muse version (dedicated Instagram/Facebook/Threads search).\n- Pages behind logins or paywalls cannot be read - they show in the Search Log as failed.\n- Deep mode makes one API call per page plus one analysis call: slower, more API credit. That is the cost of detail.\n- Deep Research adds two rounds on top: follow-up searches and a corroboration search per quote. Expect several minutes and the most API credit of any mode.\n- Best-fit spending: sources are ranked by role + full topic phrase + interview/podcast/research signals, capped at 3 pages per site for variety, and pages with no director role or topic signal are skipped before any extraction call - so the API budget goes to the pages most likely to hold a usable quote. If round 1 comes up thin, round 2 spends more pages; if it finds plenty, round 2 spends fewer.\n- No-key engine: without an OpenAI key the app uses free Pollinations AI - no sign-up, no cost, but slower with usage limits. If Pollinations fails on a page, the app falls back to rule-based extraction for that page, and to a counted analysis instead of a written one.")
+        st.markdown("- Search is DuckDuckGo, so social coverage is weaker than the Muse version (dedicated Instagram/Facebook/Threads search).\n- Pages behind logins or paywalls cannot be read - they show in the Search Log as failed.\n- Deep mode makes one API call per page plus one analysis call: slower, more API credit. That is the cost of detail.\n- Deep Research adds two rounds on top: follow-up searches and a corroboration search per quote. Expect several minutes and the most API credit of any mode.\n- Best-fit spending: sources are ranked by role + full topic phrase + interview/podcast/research signals, capped at 3 pages per site for variety, and pages with no director role or topic signal are skipped before any extraction call - so the API budget goes to the pages most likely to hold a usable quote. If round 1 comes up thin, round 2 spends more pages; if it finds plenty, round 2 spends fewer.\n- No-key engine: without an OpenAI key the app uses free Pollinations AI - no sign-up, no cost, but slower with usage limits. If Pollinations fails on a page, the app falls back to rule-based extraction for that page, and to a counted analysis instead of a written one.\n- Access: the app is password-protected only if APP_PASSWORD is set in Streamlit Secrets; without it, anyone with the link can open it. The password lives in Secrets, never in the code.")
 
 st.markdown('<div style="text-align:center;color:#8fa1c2;font-size:.8rem;margin-top:30px">Sports Psych Director Scout · Verified quotes from sports directors & club leaders · Psychology × Performance</div>', unsafe_allow_html=True)
